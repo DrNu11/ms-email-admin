@@ -12,10 +12,19 @@ const express = require("express")
 const axios = require("axios")
 const { ImapFlow } = require("imapflow")
 const { simpleParser } = require("mailparser")
+const { HttpsProxyAgent } = require("https-proxy-agent")
 const db = require("../db")
 const { requireAuth } = require("../middleware/auth")
 
 const router = express.Router()
+
+// 可选上游 HTTP 代理。云厂商常封 993 IMAP 出站端口，此时用代理隧道绕开。
+// 格式：UPSTREAM_PROXY=http://user:pass@host:port
+const UPSTREAM_PROXY = (process.env.UPSTREAM_PROXY || "").trim()
+const proxyAgent = UPSTREAM_PROXY ? new HttpsProxyAgent(UPSTREAM_PROXY) : null
+if (UPSTREAM_PROXY) {
+  console.log(`[emails] 使用上游代理: ${UPSTREAM_PROXY.replace(/\/\/.*@/, "//***:***@")}`)
+}
 
 // 整个 /api/emails/* 都要登录
 router.use(requireAuth)
@@ -47,6 +56,7 @@ async function exchangeRefreshTokenForAccessToken({ clientId, refreshToken }) {
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     timeout: 15_000,
     validateStatus: () => true,
+    ...(proxyAgent ? { httpsAgent: proxyAgent, proxy: false } : {}),
   })
 
   if (response.status >= 200 && response.status < 300 && response.data?.access_token) {
@@ -120,6 +130,7 @@ async function fetchInboxMessages({ email, accessToken }, { top = 20 } = {}) {
     auth: { user: email, accessToken },
     logger: false,
     socketTimeout: 20_000,
+    ...(UPSTREAM_PROXY ? { proxy: UPSTREAM_PROXY } : {}),
   })
   await client.connect()
   try {
@@ -169,6 +180,7 @@ async function fetchSingleMessage({ email, accessToken }, uid) {
     auth: { user: email, accessToken },
     logger: false,
     socketTimeout: 30_000,
+    ...(UPSTREAM_PROXY ? { proxy: UPSTREAM_PROXY } : {}),
   })
   await client.connect()
   try {
