@@ -45,6 +45,7 @@ db.exec(`
     password       TEXT     NOT NULL DEFAULT '',
     client_id      TEXT     NOT NULL DEFAULT '',
     refresh_token  TEXT     NOT NULL DEFAULT '',
+    access_token   TEXT     NOT NULL DEFAULT '',        -- 缓存的 access_token，配合 token_expiry 验证时效
     token_expiry   INTEGER,                            -- Unix 秒时间戳
     status         TEXT     NOT NULL DEFAULT 'active', -- active | invalid | disabled
     user_id        INTEGER,                            -- 归属用户（NULL = 旧数据/孤儿）
@@ -74,6 +75,7 @@ function ensureColumn(table, column, ddl) {
   }
 }
 ensureColumn("emails", "user_id", "user_id INTEGER")
+ensureColumn("emails", "access_token", "access_token TEXT NOT NULL DEFAULT ''")
 
 // ---------- 幂等迁移：剥离旧版 UNIQUE(email) 全局约束 ----------
 // 旧版 CREATE TABLE emails 里写的是 `email TEXT NOT NULL UNIQUE`，
@@ -95,6 +97,7 @@ if (hasLegacyUnique) {
         password       TEXT     NOT NULL DEFAULT '',
         client_id      TEXT     NOT NULL DEFAULT '',
         refresh_token  TEXT     NOT NULL DEFAULT '',
+        access_token   TEXT     NOT NULL DEFAULT '',
         token_expiry   INTEGER,
         status         TEXT     NOT NULL DEFAULT 'active',
         user_id        INTEGER,
@@ -102,9 +105,10 @@ if (hasLegacyUnique) {
         updated_at     DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
       );
       INSERT INTO emails_new
-        (id, email, password, client_id, refresh_token, token_expiry, status, user_id, created_at, updated_at)
+        (id, email, password, client_id, refresh_token, access_token, token_expiry, status, user_id, created_at, updated_at)
       SELECT
-        id, email, password, client_id, refresh_token, token_expiry, status, user_id, created_at, updated_at
+        id, email, password, client_id, refresh_token, access_token,
+        token_expiry, status, user_id, created_at, updated_at
       FROM emails;
       DROP TABLE emails;
       ALTER TABLE emails_new RENAME TO emails;

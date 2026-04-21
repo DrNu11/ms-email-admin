@@ -56,8 +56,10 @@ async function handleConfirm() {
       return
     }
 
+    const hitToken = result.withAccessToken || 0
+    const hitTokenMsg = hitToken > 0 ? `，其中 ${hitToken} 条已带有效 access_token（跳过首次刷新）` : ""
     ElMessage.success(
-      `导入完成：新增 ${result.inserted} 条，更新 ${result.updated} 条，跳过 ${result.skipped?.length ?? 0} 条（分隔符：${result.separator}）`,
+      `导入完成：新增 ${result.inserted} 条，更新 ${result.updated} 条，跳过 ${result.skipped?.length ?? 0} 条（分隔符：${result.separator}）${hitTokenMsg}`,
     )
 
     if (!result.skipped?.length) {
@@ -108,21 +110,26 @@ async function handleConfirm() {
           v-model="text"
           type="textarea"
           :autosize="{ minRows: 8, maxRows: 14 }"
-          placeholder="请粘贴邮箱数据，每行一个&#10;格式：邮箱<分隔符>密码<分隔符>client_id<分隔符>refresh_token[<分隔符>token_expiry]"
+          placeholder="请粘贴邮箱数据，每行一个&#10;支持三种格式（系统按字段数自动识别）：&#10;  4 字段：邮箱----密码----client_id----refresh_token&#10;  5 字段：邮箱----密码----client_id----refresh_token----expire_at&#10;  6 字段：邮箱----密码----client_id----refresh_token----access_token----expire_at"
           resize="vertical"
         />
       </el-form-item>
     </el-form>
 
     <el-alert type="info" show-icon :closable="false" class="tip">
-      提示：分隔符留空即可，系统会自动识别；第 5 个字段（Unix 秒时间戳）会存入 <code>token_expiry</code>。
+      <template #default>
+        分隔符留空即可，系统会自动识别。根据字段数分三种格式：
+        <strong>4 字段</strong> 基础版本 ·
+        <strong>5 字段</strong> 加 <code>expire_at</code> ·
+        <strong>6 字段</strong> 加 <code>access_token</code> + <code>expire_at</code>（如果令牌未过期会直接复用，跳过首次刷新）。
+      </template>
     </el-alert>
 
     <!-- 导入结果 / 跳过原因 -->
     <div v-if="lastResult?.skipped?.length" class="result">
       <el-alert
         :type="lastResult.inserted + lastResult.updated > 0 ? 'warning' : 'error'"
-        :title="`识别分隔符 “${lastResult.separator}” · 新增 ${lastResult.inserted} · 更新 ${lastResult.updated} · 跳过 ${lastResult.skipped.length}`"
+        :title="`识别分隔符 “${lastResult.separator}” · 新增 ${lastResult.inserted} · 更新 ${lastResult.updated} · 跳过 ${lastResult.skipped.length}${lastResult.withAccessToken ? ` · 已带有效令牌 ${lastResult.withAccessToken}` : ''}`"
         :closable="false"
         show-icon
       />

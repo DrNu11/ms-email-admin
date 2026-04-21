@@ -30,7 +30,7 @@
 | 模块 | 说明 |
 | --- | --- |
 | **用户系统** | 开放注册 / 密码登录 / JWT 无状态鉴权；首个注册用户自动成为 `admin`；提供 **游客登录** 免注册体验共享账号 |
-| **批量导入** | 粘贴文本自动识别分隔符（`----`、`\|`、`,`、`\t`、空格等），弹窗里实时提示「识别 N 行 → M 个有效」；返回新增 / 更新 / 跳过明细 |
+| **批量导入** | 按字段数智能路由：**4 字段**（基础）/ **5 字段**（加 `expire_at`）/ **6 字段**（加 `access_token + expire_at`，未过期时直接复用，跳过首次刷新）。自动识别分隔符（`----`、`\|`、`,`、`\t` 等） |
 | **邮箱管理** | 列表 + 关键词搜索 + 状态过滤 + 分页；令牌剩余以**时分自适应**显示（有效 58 分钟 / 将过期 12 分钟 / 需刷新），不再出现「剩余 0 天」的误导 |
 | **批量删除** | 多选 + 二次确认；单条走 popconfirm |
 | **令牌刷新** | 用 `refresh_token` 调微软 OAuth2 端点换新 `access_token`，成功更新 `token_expiry` + `refresh_token`，失败自动把邮箱标记为 `invalid` |
@@ -144,16 +144,18 @@ npm run dev
 
 ### 批量导入
 
-点右上 **「批量导入」** 弹出对话框：
+点右上 **「批量导入」** 弹出对话框。后端按**字段数自动路由**，一种解析器同时支持三种格式：
 
-```
-邮箱----密码----client_id----refresh_token
-```
+| 字段数 | 格式 | 行为 |
+| --- | --- | --- |
+| **4** | `邮箱----密码----client_id----refresh_token` | 基础版本。导入后「令牌 / 剩余」显示「未刷新」，点「刷新令牌」或「收件箱」时才实际调 MS 端点 |
+| **5** | `邮箱----密码----client_id----refresh_token----expire_at` | 多一个 `expire_at`（Unix 秒或毫秒）。后端自动辨识秒/毫秒；仅存入 `token_expiry`，仍需首次刷新才能拿到 access_token |
+| **6** | `邮箱----密码----client_id----refresh_token----access_token----expire_at` | **推荐**。后端将 access_token + expire_at 一同入库；若 `expire_at > now+60s`，点「收件箱」直接复用缓存令牌，**跳过首次 refresh**，避免为新号触发 MS 的风控模型 |
 
-- 分隔符：默认 `----`，也支持 `|`、`,`、`\t`、空格（请求时可用 `?sep=----` 覆盖）
-- **每行 2-4 字段** 都合法：`email|password` → 无 client_id/refresh_token 的行会导入但不能刷新令牌
+- 分隔符：默认自动识别（依次试 `-----` / `----` / `---` / `||` / `::` / `\t` / `,`），可用 `?sep=` query 参数或弹窗输入框手动指定
 - 同一用户不能重复导入相同邮箱（`UNIQUE(user_id, email)`）；**不同用户之间互不影响**
-- 弹窗底部实时提示 **识别 N 行 → M 个有效**；确认后后端返回 `{added, updated, skipped[]}` 明细，被跳过的行会附带 `reason`
+- 后端返回 `{ok, separator, imported, inserted, updated, withAccessToken, skipped[]}`；`withAccessToken` 是本次导入中带有有效 access_token 的行数，用户可直观确认哪些行跳过了首次刷新
+- `expire_at` 容错：> 1e12 视为毫秒自动除 1000；非数 / 负数 / 0 则当作缺省
 
 ### 令牌刷新与过期语义
 
@@ -246,7 +248,8 @@ SQLite 文件位于 `backend/data/emails.db`，启用 **WAL 模式**。`backend/
 | `password` | TEXT | 邮箱原始密码（明文存储，见[安全须知](#安全须知)） |
 | `client_id` | TEXT | Azure 应用的 client_id |
 | `refresh_token` | TEXT | 微软 OAuth2 refresh_token，每次刷新会滚动替换 |
-| `token_expiry` | INTEGER | access_token 过期 Unix 秒（刷新成功后写入） |
+| `access_token` | TEXT | 缓存的 access_token。导入时带入或刷新时写入；`getUsableAccessToken()` 优先读它，避免无谓 refresh |
+| `token_expiry` | INTEGER | access_token 过期 Unix 秒。与 `access_token` 配合判断缓存是否有效 |
 | `status` | TEXT | `active` \| `invalid` \| `disabled` |
 | `user_id` | INTEGER | 归属用户（`NULL` = 历史孤儿行，不会显示给任何人） |
 
@@ -259,7 +262,7 @@ SQLite 文件位于 `backend/data/emails.db`，启用 **WAL 模式**。`backend/
 
 `init_db.js` 会自动做：
 
-1. 新增缺失列：`user_id`
+1. 新增缺失列：`user_id`、`access_token`
 2. 若检测到旧版全局 `UNIQUE(email)` 约束 → 重建表剥离（事务中 COPY → DROP → RENAME）
 3. 确保 `UNIQUE(user_id, email)` 联合索引存在
 
@@ -290,7 +293,7 @@ SQLite 文件位于 `backend/data/emails.db`，启用 **WAL 模式**。`backend/
 
 | 方法 | 路径 | 入参 | 说明 |
 | --- | --- | --- | --- |
-| POST | `/emails/import` | `text/plain` 粘贴 或 `{text}` / `{content}`（query `?sep=----` 可覆盖分隔符） | 批量导入。返回 `{added, updated, skipped:[{line, reason}]}` |
+| POST | `/emails/import` | `text/plain` 粘贴 或 `{text}` / `{content}`（query `?sep=----` 可覆盖分隔符） | 批量导入，按字段数自动识别 4/5/6 种格式。返回 `{ok, separator, imported, inserted, updated, withAccessToken, skipped:[{line, reason}]}`；`withAccessToken` 是本次导入中自带有效 access_token（`expire_at > now+60s`）的行数 |
 | GET | `/emails` | `?page=&pageSize=&search=&status=` | 分页列表。返回 `{list, total, page, pageSize}` |
 | POST | `/emails/refresh` | `{id}` | 刷新指定邮箱的令牌。成功 `{ok, expiresIn}`；失败自动把该邮箱置 `status=invalid` |
 | GET | `/emails/:id/messages` | query `?top=20` | **拉取收件箱**（IMAP）。返回 `{ok, total, messages:[{uid, subject, from, date, seen}]}` |

@@ -63,6 +63,54 @@ async function exchangeRefreshTokenForAccessToken({ clientId, refreshToken }) {
   throw err
 }
 
+/**
+ * 解析导入时的 expire_at 字段：
+ * - 空 / 非数 / 非正 → null
+ * - > 1e12 视为毫秒时间戳，除 1000
+ * - 其他数值视为秒级 Unix 时间戳
+ */
+function parseExpiry(raw) {
+  if (raw === undefined || raw === null || raw === "") return null
+  const n = Number(String(raw).trim())
+  if (!Number.isFinite(n) || n <= 0) return null
+  return n > 1e12 ? Math.floor(n / 1000) : Math.floor(n)
+}
+
+/**
+ * 拿到一个可用的 access_token：
+ * - 如果 DB 里缓存的 access_token 非空且 token_expiry > now+60s → 直接复用
+ * - 否则调 MS OAuth2 端点刷新，把新 token 回写 DB
+ * @param {{ id, user_id, email, client_id, refresh_token, access_token, token_expiry }} row
+ */
+async function getUsableAccessToken(row) {
+  const now = Math.floor(Date.now() / 1000)
+  if (row.access_token && row.token_expiry && row.token_expiry > now + 60) {
+    return { accessToken: row.access_token, fromCache: true }
+  }
+
+  const result = await exchangeRefreshTokenForAccessToken({
+    clientId: row.client_id,
+    refreshToken: row.refresh_token,
+  })
+  const tokenExpiry = Math.floor(Date.now() / 1000) + result.expiresIn
+  try {
+    db.prepare(
+      `UPDATE emails
+         SET refresh_token = ?, access_token = ?, token_expiry = ?, status = 'active'
+       WHERE id = ? AND user_id = ?`,
+    ).run(result.newRefreshToken, result.accessToken, tokenExpiry, row.id, row.user_id)
+  } catch (_) {
+    /* DB 回写失败不影响当前请求 */
+  }
+  return {
+    accessToken: result.accessToken,
+    newRefreshToken: result.newRefreshToken,
+    expiresIn: result.expiresIn,
+    tokenExpiry,
+    fromCache: false,
+  }
+}
+
 /** 用 XOAUTH2 连 IMAP，抓 INBOX 最近 top 封邮件元信息。按日期新→旧 */
 async function fetchInboxMessages({ email, accessToken }, { top = 20 } = {}) {
   const client = new ImapFlow({
@@ -233,10 +281,31 @@ router.post("/import", (req, res, next) => {
     for (const line of lines) {
       const parts = line.split(separator).map((value) => value.trim())
       if (parts.length < 4) {
-        skipped.push({ line, reason: "字段不足 4 个（邮箱<sep>密码<sep>client_id<sep>refresh_token）" })
+        skipped.push({
+          line,
+          reason: "字段不足 4 个（至少需要：邮箱<sep>密码<sep>client_id<sep>refresh_token）",
+        })
         continue
       }
-      const [email, password, clientId, refreshToken, expiryRaw] = parts
+
+      // 按字段数智能路由：
+      //   4 字段  email / password / client_id / refresh_token
+      //   5 字段  email / password / client_id / refresh_token / expire_at
+      //   6+ 字段 email / password / client_id / refresh_token / access_token / expire_at (多余字段忽略)
+      const email = parts[0]
+      const password = parts[1]
+      const clientId = parts[2]
+      const refreshToken = parts[3]
+
+      let accessToken = ""
+      let tokenExpiry = null
+      if (parts.length >= 6) {
+        accessToken = parts[4] || ""
+        tokenExpiry = parseExpiry(parts[5])
+      } else if (parts.length === 5) {
+        tokenExpiry = parseExpiry(parts[4])
+      }
+
       if (!email || !email.includes("@")) {
         skipped.push({ line, reason: "邮箱格式不合法" })
         continue
@@ -248,15 +317,7 @@ router.post("/import", (req, res, next) => {
       }
       seen.add(key)
 
-      let tokenExpiry = null
-      if (expiryRaw) {
-        const numeric = Number(expiryRaw)
-        if (Number.isFinite(numeric) && numeric > 0) {
-          tokenExpiry = Math.floor(numeric)
-        }
-      }
-
-      rows.push({ email, password, clientId, refreshToken, tokenExpiry })
+      rows.push({ email, password, clientId, refreshToken, accessToken, tokenExpiry })
     }
 
     const userId = req.user.id
@@ -264,14 +325,15 @@ router.post("/import", (req, res, next) => {
       "SELECT id FROM emails WHERE email = ? AND user_id = ?",
     )
     const insertStmt = db.prepare(`
-      INSERT INTO emails (email, password, client_id, refresh_token, token_expiry, status, user_id)
-      VALUES (@email, @password, @clientId, @refreshToken, @tokenExpiry, 'active', @userId)
+      INSERT INTO emails (email, password, client_id, refresh_token, access_token, token_expiry, status, user_id)
+      VALUES (@email, @password, @clientId, @refreshToken, @accessToken, @tokenExpiry, 'active', @userId)
     `)
     const updateStmt = db.prepare(`
       UPDATE emails SET
         password      = @password,
         client_id     = @clientId,
         refresh_token = @refreshToken,
+        access_token  = CASE WHEN @accessToken <> '' THEN @accessToken ELSE access_token END,
         token_expiry  = COALESCE(@tokenExpiry, token_expiry),
         status        = 'active'
       WHERE email = @email AND user_id = @userId
@@ -296,6 +358,9 @@ router.post("/import", (req, res, next) => {
 
     const { inserted, updated } = runBatch(rows)
 
+    const now = Math.floor(Date.now() / 1000)
+    const withAccessToken = rows.filter((r) => r.accessToken && r.tokenExpiry && r.tokenExpiry > now + 60).length
+
     res.json({
       ok: true,
       separator,
@@ -303,6 +368,7 @@ router.post("/import", (req, res, next) => {
       imported: rows.length,
       inserted,
       updated,
+      withAccessToken,               // 本次导入中带有有效 access_token 的行数
       skipped,
     })
   } catch (error) {
@@ -325,7 +391,8 @@ router.post("/refresh", async (req, res, next) => {
   try {
     row = db
       .prepare(
-        "SELECT id, email, client_id, refresh_token FROM emails WHERE id = ? AND user_id = ?",
+        `SELECT id, email, client_id, refresh_token, access_token, token_expiry, user_id
+         FROM emails WHERE id = ? AND user_id = ?`,
       )
       .get(id, req.user.id)
   } catch (error) {
@@ -339,60 +406,30 @@ router.post("/refresh", async (req, res, next) => {
     return res.status(400).json({ error: "该邮箱缺少 client_id 或 refresh_token" })
   }
 
+  // 手动刷新总是强制调 MS 端点（而不用缓存），绕开 getUsableAccessToken 的复用逻辑
   try {
-    const form = new URLSearchParams()
-    form.set("grant_type", "refresh_token")
-    form.set("client_id", row.client_id)
-    form.set("refresh_token", row.refresh_token)
-    form.set("scope", DEFAULT_SCOPE)
-
-    const response = await axios.post(MS_TOKEN_ENDPOINT, form, {
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      timeout: 15_000,
-      validateStatus: () => true,
+    const result = await exchangeRefreshTokenForAccessToken({
+      clientId: row.client_id,
+      refreshToken: row.refresh_token,
     })
+    const tokenExpiry = Math.floor(Date.now() / 1000) + result.expiresIn
 
-    if (response.status >= 200 && response.status < 300 && response.data?.access_token) {
-      const data = response.data
-      const newRefresh = data.refresh_token || row.refresh_token
-      const expiresIn = Number(data.expires_in) || 3600
-      const tokenExpiry = Math.floor(Date.now() / 1000) + expiresIn
+    db.prepare(
+      `UPDATE emails
+         SET refresh_token = ?, access_token = ?, token_expiry = ?, status = 'active'
+       WHERE id = ? AND user_id = ?`,
+    ).run(result.newRefreshToken, result.accessToken, tokenExpiry, id, req.user.id)
 
-      db.prepare(
-        `UPDATE emails
-           SET refresh_token = ?, token_expiry = ?, status = 'active'
-         WHERE id = ? AND user_id = ?`,
-      ).run(newRefresh, tokenExpiry, id, req.user.id)
-
-      return res.json({
-        ok: true,
-        id,
-        email: row.email,
-        accessToken: data.access_token,
-        expiresIn,
-        tokenExpiry,
-      })
-    }
-
-    const detail =
-      response.data?.error_description ||
-      response.data?.error ||
-      `HTTP ${response.status}`
-    db.prepare(`UPDATE emails SET status = 'invalid' WHERE id = ? AND user_id = ?`).run(
-      id,
-      req.user.id,
-    )
-    return res.status(502).json({
-      ok: false,
+    return res.json({
+      ok: true,
       id,
       email: row.email,
-      error: `刷新令牌失败：${detail}`,
+      accessToken: result.accessToken,
+      expiresIn: result.expiresIn,
+      tokenExpiry,
     })
   } catch (error) {
-    const detail =
-      error.response?.data?.error_description ||
-      error.response?.data?.error ||
-      error.message
+    const detail = error?.message || String(error)
     try {
       db.prepare(
         `UPDATE emails SET status = 'invalid' WHERE id = ? AND user_id = ?`,
@@ -404,7 +441,7 @@ router.post("/refresh", async (req, res, next) => {
       ok: false,
       id,
       email: row?.email,
-      error: `刷新令牌失败：${detail}`,
+      error: detail,
     })
   }
 })
@@ -469,7 +506,8 @@ router.get("/:id/messages", async (req, res, next) => {
 
   const row = db
     .prepare(
-      "SELECT id, email, client_id, refresh_token FROM emails WHERE id = ? AND user_id = ?",
+      `SELECT id, email, client_id, refresh_token, access_token, token_expiry, user_id
+       FROM emails WHERE id = ? AND user_id = ?`,
     )
     .get(id, req.user.id)
   if (!row) return res.status(404).json({ error: `邮箱不存在：id=${id}` })
@@ -480,23 +518,8 @@ router.get("/:id/messages", async (req, res, next) => {
   }
 
   try {
-    const { accessToken, newRefreshToken, expiresIn } =
-      await exchangeRefreshTokenForAccessToken({
-        clientId: row.client_id,
-        refreshToken: row.refresh_token,
-      })
-
-    // token 拿到了 → 顺手把 DB 里的 refresh_token / 过期时间 / status 更新一下
-    const tokenExpiry = Math.floor(Date.now() / 1000) + expiresIn
-    try {
-      db.prepare(
-        `UPDATE emails
-           SET refresh_token = ?, token_expiry = ?, status = 'active'
-         WHERE id = ? AND user_id = ?`,
-      ).run(newRefreshToken, tokenExpiry, id, req.user.id)
-    } catch (_) {
-      /* DB 更新失败不影响读信，忽略 */
-    }
+    // 优先用缓存的 access_token，过期才去刷新
+    const { accessToken } = await getUsableAccessToken(row)
 
     const { total, messages } = await fetchInboxMessages(
       { email: row.email, accessToken },
@@ -549,7 +572,8 @@ router.get("/:id/messages/:uid", async (req, res, next) => {
 
   const row = db
     .prepare(
-      "SELECT id, email, client_id, refresh_token FROM emails WHERE id = ? AND user_id = ?",
+      `SELECT id, email, client_id, refresh_token, access_token, token_expiry, user_id
+       FROM emails WHERE id = ? AND user_id = ?`,
     )
     .get(id, req.user.id)
   if (!row) return res.status(404).json({ error: `邮箱不存在：id=${id}` })
@@ -560,21 +584,7 @@ router.get("/:id/messages/:uid", async (req, res, next) => {
   }
 
   try {
-    const { accessToken, newRefreshToken, expiresIn } =
-      await exchangeRefreshTokenForAccessToken({
-        clientId: row.client_id,
-        refreshToken: row.refresh_token,
-      })
-    const tokenExpiry = Math.floor(Date.now() / 1000) + expiresIn
-    try {
-      db.prepare(
-        `UPDATE emails
-           SET refresh_token = ?, token_expiry = ?, status = 'active'
-         WHERE id = ? AND user_id = ?`,
-      ).run(newRefreshToken, tokenExpiry, id, req.user.id)
-    } catch (_) {
-      /* ignore */
-    }
+    const { accessToken } = await getUsableAccessToken(row)
 
     const message = await fetchSingleMessage(
       { email: row.email, accessToken },
